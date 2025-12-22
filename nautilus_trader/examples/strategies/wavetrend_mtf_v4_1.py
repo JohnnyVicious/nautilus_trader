@@ -14,6 +14,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import math
 from decimal import Decimal
 
 from nautilus_trader.config import PositiveFloat
@@ -357,6 +358,10 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         """Actions to be performed on strategy start."""
         self.log.info(f"Starting {self.__class__.__name__}")
 
+        # PR #1 CRITICAL FIX: Add tracking flags for stop order management
+        self._pending_stop_cancel = False  # Track if waiting for cancel confirmation
+        self._last_stop_price = None  # Track last submitted stop price (spam prevention)
+
         # Subscribe to 5-minute bars
         bar_type_5m = BarType.from_str(
             f"{self.instrument_id}-5-MINUTE-LAST-EXTERNAL"
@@ -694,7 +699,32 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         self.submit_order(order)
 
     def on_order_filled(self, event) -> None:
-        """Handle order filled events."""
+        """
+        Handle order filled events.
+
+        PR #1 CRITICAL FIX (Issue #2): Detect stop fills vs entry fills.
+        CRITICAL: Must distinguish between:
+        - Entry fills (market orders) → initialize state and set stop
+        - Stop fills (stop orders) → clear state and close position
+        """
+        # Check if this was our stop order filling
+        if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
+            self.log.info(
+                f"Stop order filled: {event.order_side} {event.last_qty} @ {event.last_px} "
+                f"(position closed by stop)"
+            )
+
+            # PR #1 CRITICAL FIX: Clear all state when stop fills
+            self.entry_price = None
+            self.peak_price = None
+            self.stop_order = None
+            self.use_percentage_trail = False
+            self._pending_stop_cancel = False
+            self._last_stop_price = None
+
+            return  # Don't treat stop fill as new entry
+
+        # This is an entry fill (market order)
         if event.order_side == OrderSide.BUY or event.order_side == OrderSide.SELL:
             # Entry order filled - set initial stop
             self.entry_price = event.last_px.as_double()
@@ -708,9 +738,72 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             # Set initial ATR-based stop
             self._set_atr_stop(event.order_side)
 
+    def on_order_cancelled(self, event) -> None:
+        """
+        Handle order cancellation confirmation.
+
+        PR #1 CRITICAL FIX (Issue #1): This prevents creating duplicate stops by
+        waiting for cancel confirmation before submitting replacement stop.
+        """
+        # Clear the stop reference if it was our stop that got cancelled
+        if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
+            self.log.info(
+                f"Stop order {self.stop_order.client_order_id} successfully cancelled"
+            )
+            self.stop_order = None
+            self._pending_stop_cancel = False
+
+    def on_order_rejected(self, event) -> None:
+        """
+        Handle order rejection events.
+
+        PR #1 CRITICAL FIX (Issue #3): If a stop order is rejected, the position
+        is UNPROTECTED. We must either retry stop submission or close position.
+        """
+        # Check if this was our stop order being rejected
+        if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
+            self.log.error(
+                f"CRITICAL: Stop order REJECTED - position is UNPROTECTED! "
+                f"Reason: {event.reason}"
+            )
+
+            # Clear stop reference
+            self.stop_order = None
+            self._pending_stop_cancel = False
+            self._last_stop_price = None
+
+            # Check if position still exists
+            position = self.cache.position(self.instrument_id)
+            if position is not None and position.is_open:
+                # Position is open but stop was rejected - CRITICAL situation
+                # Strategy: Close position immediately (safest approach)
+                self.log.warning(
+                    f"Closing position immediately due to stop rejection - "
+                    f"cannot trade without stop protection"
+                )
+                self.close_all_positions(self.instrument_id)
+
+                # Clear state
+                self.entry_price = None
+                self.peak_price = None
+                self.use_percentage_trail = False
+
+            return
+
+        # Entry order rejection (less critical but should log)
+        self.log.warning(
+            f"Order rejected: {event.client_order_id} - Reason: {event.reason}"
+        )
+
     def _set_atr_stop(self, entry_side: OrderSide) -> None:
-        """Set ATR-based trailing stop."""
-        if not self.atr.initialized or self.entry_price is None:
+        """
+        Set ATR-based trailing stop.
+
+        PR #1 CRITICAL FIX (Issues #1, #5): Deferred creation + validation.
+        """
+        # Check position exists
+        position = self.cache.position(self.instrument_id)
+        if position is None or not position.is_open:
             return
 
         # Get instrument from cache
@@ -719,57 +812,115 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             self.log.error(f"Cannot set ATR stop - instrument {self.instrument_id} not found in cache")
             return
 
+        # PR #1 FIX (Issue #1): Cancel existing stop and mark pending
+        # CRITICAL: Wait for cancellation before creating new stop
+        if self.stop_order is not None:
+            self.log.info(
+                f"Cancelling existing stop {self.stop_order.client_order_id} before creating new ATR stop"
+            )
+            self._pending_stop_cancel = True
+            self.cancel_order(self.stop_order)
+            # DO NOT create new stop here - wait for on_order_cancelled callback
+            return
+
+        # Get current price and ATR
+        current_price = position.avg_px_open
+        atr = self.atr.value
+
+        # PR #1 FIX (Issue #5): Validate ATR is valid
+        if atr is None or atr <= 0 or not math.isfinite(atr):
+            self.log.error(
+                f"Cannot set ATR stop - invalid ATR value: {atr}"
+            )
+            # Close position if we can't protect it
+            self.log.warning("Closing position due to inability to set stop loss")
+            self.close_all_positions(self.instrument_id)
+            return
+
+        # ATR sanity check (shouldn't be >10x the price)
+        if atr > current_price * 10:
+            self.log.error(
+                f"ATR value suspiciously large ({atr:.2f}) vs price ({current_price:.2f}) - "
+                f"possible calculation error"
+            )
+            self.close_all_positions(self.instrument_id)
+            return
+
         # Calculate stop distance
-        stop_distance = self.atr.value * self.atr_multiplier
+        stop_distance = atr * self.atr_multiplier
 
         # Calculate stop price based on position direction
         if entry_side == OrderSide.BUY:
-            # Long position - stop below entry
-            stop_price = self.entry_price - stop_distance
-            trigger_price = instrument.make_price(stop_price)
+            stop_price = current_price - stop_distance
+        else:
+            stop_price = current_price + stop_distance
 
-            # Cancel existing stop if any
-            if self.stop_order is not None:
-                self.cancel_order(self.stop_order)
-
-            # Create new stop order
-            self.stop_order = self.order_factory.stop_market(
-                instrument_id=self.instrument_id,
-                order_side=OrderSide.SELL,
-                quantity=instrument.make_qty(self.trade_size),
-                trigger_price=trigger_price,
-                trigger_type=TriggerType.DEFAULT,
-                time_in_force=TimeInForce.GTC,
+        # PR #1 FIX (Issue #5): Validate stop price is positive
+        if stop_price <= 0:
+            self.log.error(
+                f"Calculated stop price is invalid ({stop_price:.2f}) - "
+                f"current={current_price:.2f}, ATR={atr:.2f}, mult={self.atr_multiplier}"
             )
-            self.submit_order(self.stop_order)
+            self.close_all_positions(self.instrument_id)
+            return
 
-            self.log.info(f"ATR stop set at {stop_price:.2f} (distance: {stop_distance:.2f})")
+        # Validate stop price is reasonable distance from current price
+        min_distance_pct = 0.001  # 0.1% minimum
+        distance_pct = abs(stop_price - current_price) / current_price
 
-        elif entry_side == OrderSide.SELL:
-            # Short position - stop above entry
-            stop_price = self.entry_price + stop_distance
-            trigger_price = instrument.make_price(stop_price)
-
-            # Cancel existing stop if any
-            if self.stop_order is not None:
-                self.cancel_order(self.stop_order)
-
-            # Create new stop order
-            self.stop_order = self.order_factory.stop_market(
-                instrument_id=self.instrument_id,
-                order_side=OrderSide.BUY,
-                quantity=instrument.make_qty(self.trade_size),
-                trigger_price=trigger_price,
-                trigger_type=TriggerType.DEFAULT,
-                time_in_force=TimeInForce.GTC,
+        if distance_pct < min_distance_pct:
+            self.log.error(
+                f"Stop price ({stop_price:.2f}) too close to current price ({current_price:.2f}) - "
+                f"distance {distance_pct*100:.3f}% < minimum {min_distance_pct*100:.1f}%"
             )
-            self.submit_order(self.stop_order)
+            self.close_all_positions(self.instrument_id)
+            return
 
-            self.log.info(f"ATR stop set at {stop_price:.2f} (distance: {stop_distance:.2f})")
+        # Validate stop respects position direction
+        if entry_side == OrderSide.BUY and stop_price >= current_price:
+            self.log.error(
+                f"LONG stop price ({stop_price:.2f}) must be BELOW current price ({current_price:.2f})"
+            )
+            self.close_all_positions(self.instrument_id)
+            return
+
+        if entry_side == OrderSide.SELL and stop_price <= current_price:
+            self.log.error(
+                f"SHORT stop price ({stop_price:.2f}) must be ABOVE current price ({current_price:.2f})"
+            )
+            self.close_all_positions(self.instrument_id)
+            return
+
+        # All validations passed - create stop order
+        trigger_price = instrument.make_price(stop_price)
+
+        self.stop_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id,
+            order_side=OrderSide.SELL if entry_side == OrderSide.BUY else OrderSide.BUY,
+            quantity=instrument.make_qty(self.trade_size),
+            trigger_price=trigger_price,
+            trigger_type=TriggerType.DEFAULT,
+            time_in_force=TimeInForce.GTC,
+        )
+        self.submit_order(self.stop_order)
+
+        # PR #1 FIX (Issue #4): Track last stop price for spam prevention
+        self._last_stop_price = stop_price
+
+        self.log.info(
+            f"Set ATR stop: {stop_price:.2f} (ATR={atr:.2f}, mult={self.atr_multiplier}, "
+            f"distance={distance_pct*100:.2f}%)"
+        )
 
     def _set_percentage_stop(self, position_side: OrderSide) -> None:
-        """Set percentage-based trailing stop from peak price."""
-        if self.peak_price is None:
+        """
+        Set percentage-based trailing stop from peak price.
+
+        PR #1 CRITICAL FIX (Issues #1, #5): Deferred creation + validation.
+        """
+        # Check position exists
+        position = self.cache.position(self.instrument_id)
+        if position is None or not position.is_open:
             return
 
         # Get instrument from cache
@@ -778,63 +929,104 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             self.log.error(f"Cannot set percentage stop - instrument {self.instrument_id} not found in cache")
             return
 
+        # PR #1 FIX (Issue #1): Cancel existing stop and mark pending
+        # CRITICAL: Wait for cancellation before creating new stop
+        if self.stop_order is not None:
+            self.log.info(
+                f"Cancelling existing stop {self.stop_order.client_order_id} before creating new percentage stop"
+            )
+            self._pending_stop_cancel = True
+            self.cancel_order(self.stop_order)
+            return
+
+        # PR #1 FIX (Issue #5): Validate peak price
+        if self.peak_price is None or self.peak_price <= 0:
+            self.log.error(
+                f"Cannot set percentage stop - invalid peak price: {self.peak_price}"
+            )
+            self.close_all_positions(self.instrument_id)
+            return
+
+        # Calculate stop price from peak
+        trail_distance_pct = self.percentage_trail
+
+        # Validate trail percentage is reasonable
+        if trail_distance_pct <= 0 or trail_distance_pct >= 1.0:
+            self.log.error(
+                f"Invalid trail percentage: {trail_distance_pct*100:.1f}% "
+                f"(must be between 0 and 100)"
+            )
+            self.close_all_positions(self.instrument_id)
+            return
+
         if position_side == OrderSide.BUY:
-            # Long position - trail below peak
-            stop_price = self.peak_price * (1 - self.percentage_trail)
-            trigger_price = instrument.make_price(stop_price)
+            stop_price = self.peak_price * (1 - trail_distance_pct)
+        else:
+            stop_price = self.peak_price * (1 + trail_distance_pct)
 
-            # Cancel existing stop
-            if self.stop_order is not None:
-                self.cancel_order(self.stop_order)
-
-            # Create new stop
-            self.stop_order = self.order_factory.stop_market(
-                instrument_id=self.instrument_id,
-                order_side=OrderSide.SELL,
-                quantity=instrument.make_qty(self.trade_size),
-                trigger_price=trigger_price,
-                trigger_type=TriggerType.DEFAULT,
-                time_in_force=TimeInForce.GTC,
+        # PR #1 FIX (Issue #5): Validate stop price is positive
+        if stop_price <= 0:
+            self.log.error(
+                f"Calculated percentage stop price is invalid ({stop_price:.2f}) - "
+                f"peak={self.peak_price:.2f}, trail={trail_distance_pct*100:.1f}%"
             )
-            self.submit_order(self.stop_order)
+            self.close_all_positions(self.instrument_id)
+            return
 
-            self.log.info(
-                f"Percentage stop updated: {stop_price:.2f} "
-                f"({self.percentage_trail * 100:.1f}% from peak {self.peak_price:.2f})"
+        # Get current price and check stop direction
+        current_price = position.avg_px_open
+
+        if position_side == OrderSide.BUY and stop_price >= current_price:
+            self.log.error(
+                f"LONG percentage stop ({stop_price:.2f}) cannot be above current price ({current_price:.2f})"
             )
+            self.close_all_positions(self.instrument_id)
+            return
 
-        elif position_side == OrderSide.SELL:
-            # Short position - trail above peak (lowest point)
-            stop_price = self.peak_price * (1 + self.percentage_trail)
-            trigger_price = instrument.make_price(stop_price)
-
-            # Cancel existing stop
-            if self.stop_order is not None:
-                self.cancel_order(self.stop_order)
-
-            # Create new stop
-            self.stop_order = self.order_factory.stop_market(
-                instrument_id=self.instrument_id,
-                order_side=OrderSide.BUY,
-                quantity=instrument.make_qty(self.trade_size),
-                trigger_price=trigger_price,
-                trigger_type=TriggerType.DEFAULT,
-                time_in_force=TimeInForce.GTC,
+        if position_side == OrderSide.SELL and stop_price <= current_price:
+            self.log.error(
+                f"SHORT percentage stop ({stop_price:.2f}) cannot be below current price ({current_price:.2f})"
             )
-            self.submit_order(self.stop_order)
+            self.close_all_positions(self.instrument_id)
+            return
 
-            self.log.info(
-                f"Percentage stop updated: {stop_price:.2f} "
-                f"({self.percentage_trail * 100:.1f}% from peak {self.peak_price:.2f})"
-            )
+        # All validations passed - create stop order
+        trigger_price = instrument.make_price(stop_price)
+
+        self.stop_order = self.order_factory.stop_market(
+            instrument_id=self.instrument_id,
+            order_side=OrderSide.SELL if position_side == OrderSide.BUY else OrderSide.BUY,
+            quantity=instrument.make_qty(self.trade_size),
+            trigger_price=trigger_price,
+            trigger_type=TriggerType.DEFAULT,
+            time_in_force=TimeInForce.GTC,
+        )
+        self.submit_order(self.stop_order)
+
+        # PR #1 FIX (Issue #4): Track last stop price for spam prevention
+        self._last_stop_price = stop_price
+
+        self.log.info(
+            f"Set percentage stop: {stop_price:.2f} (peak={self.peak_price:.2f}, "
+            f"trail={trail_distance_pct*100:.1f}%, current={current_price:.2f})"
+        )
 
     def _update_trailing_stop(self, bar: Bar) -> None:
-        """Update trailing stop based on current price and P&L."""
+        """
+        Update trailing stop based on current price and P&L.
+
+        PR #1 CRITICAL FIX (Issue #4): Spam prevention + pending cancel guard.
+        """
         # Only update if in a position
         if self.portfolio.is_flat(self.instrument_id):
             return
 
         if self.entry_price is None:
+            return
+
+        # PR #1 FIX: Don't update stops while cancel is pending
+        if self._pending_stop_cancel:
+            self.log.debug("Skipping stop update - cancel pending")
             return
 
         # Get current position
@@ -872,8 +1064,34 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
 
         # Update stop based on current mode
         elif self.use_percentage_trail:
-            # Update percentage stop if peak moved
-            self._set_percentage_stop(position.side)
+            # PR #1 FIX (Issue #4): Only update if stop price actually changed
+            # Calculate what the new stop price WOULD be
+            trail_distance_pct = self.percentage_trail
+
+            if position.side == OrderSide.BUY:
+                new_stop_price = self.peak_price * (1 - trail_distance_pct)
+            else:
+                new_stop_price = self.peak_price * (1 + trail_distance_pct)
+
+            # CRITICAL: Only update if stop price changed significantly
+            # Use small epsilon for float comparison
+            EPSILON = 0.01  # 1 cent minimum movement
+
+            if self._last_stop_price is None:
+                # No stop set yet - set it
+                self._set_percentage_stop(position.side)
+            elif abs(new_stop_price - self._last_stop_price) >= EPSILON:
+                # Stop price changed significantly - update it
+                self.log.info(
+                    f"Stop price moved: {self._last_stop_price:.2f} → {new_stop_price:.2f} "
+                    f"(peak={self.peak_price:.2f})"
+                )
+                self._set_percentage_stop(position.side)
+            else:
+                # Stop price unchanged - skip update (spam prevention)
+                self.log.debug(
+                    f"Stop price unchanged ({self._last_stop_price:.2f}) - skipping update"
+                )
 
     def on_position_closed(self, position) -> None:
         """Handle position closed event."""
