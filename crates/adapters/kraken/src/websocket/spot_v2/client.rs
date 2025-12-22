@@ -57,7 +57,7 @@ const WS_PING_MSG: &str = r#"{"method":"ping"}"#;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.adapters")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken")
 )]
 pub struct KrakenSpotWebSocketClient {
     url: String,
@@ -139,8 +139,6 @@ impl KrakenSpotWebSocketClient {
         let ws_config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            message_handler: Some(raw_handler),
-            ping_handler: None,
             heartbeat: self.config.heartbeat_interval_secs,
             heartbeat_msg: Some(WS_PING_MSG.to_string()),
             reconnect_timeout_ms: Some(5_000),
@@ -153,6 +151,8 @@ impl KrakenSpotWebSocketClient {
 
         let ws_client = WebSocketClient::connect(
             ws_config,
+            Some(raw_handler),
+            None,   // ping_handler
             None,   // post_reconnection
             vec![], // keyed_quotas
             None,   // default_quota

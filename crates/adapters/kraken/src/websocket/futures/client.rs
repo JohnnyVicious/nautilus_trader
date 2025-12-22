@@ -53,7 +53,7 @@ const WS_PING_MSG: &str = r#"{"event":"ping"}"#;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.adapters")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken")
 )]
 pub struct KrakenFuturesWebSocketClient {
     url: String,
@@ -255,8 +255,6 @@ impl KrakenFuturesWebSocketClient {
         let ws_config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            message_handler: Some(raw_handler),
-            ping_handler: None,
             heartbeat: self.heartbeat_secs,
             heartbeat_msg: Some(WS_PING_MSG.to_string()),
             reconnect_timeout_ms: Some(5_000),
@@ -267,9 +265,10 @@ impl KrakenFuturesWebSocketClient {
             reconnect_max_attempts: None,
         };
 
-        let ws_client = WebSocketClient::connect(ws_config, None, vec![], None)
-            .await
-            .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
+        let ws_client =
+            WebSocketClient::connect(ws_config, Some(raw_handler), None, None, vec![], None)
+                .await
+                .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
 
         self.connection_mode
             .store(ws_client.connection_mode_atomic());
