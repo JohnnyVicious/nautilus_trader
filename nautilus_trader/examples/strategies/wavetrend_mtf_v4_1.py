@@ -1257,11 +1257,22 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
                 )
 
     def on_position_closed(self, position) -> None:
-        """Handle position closed event."""
+        """
+        Handle position closed event.
+
+        BUGFIX: Clear ALL state including tracking flags to ensure complete cleanup.
+        This handles edge cases like manual closes, risk engine closes, liquidations.
+        """
         self.log.info(f"Position closed: {position}")
 
-        # Reset state
+        # Reset ALL state (complete cleanup)
         self.entry_price = None
         self.peak_price = None
         self.stop_order = None
         self.use_percentage_trail = False
+
+        # BUGFIX: Also clear tracking flags (PR #1 & #2)
+        # Critical: Ensures clean state for next position in all close scenarios
+        self._pending_stop_cancel = False
+        self._last_stop_price = None
+        self._pending_entry_order = None
