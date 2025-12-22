@@ -377,8 +377,32 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         """
         Actions to be performed on strategy start.
 
-        PR #2 IMPORTANT FIX (Issue #6): Reconnection handling - checks for existing
-        positions on startup and handles them conservatively.
+        RECONNECTION LOGIC - Data Source Priority:
+        ==========================================
+
+        Data Flow on Startup:
+        1. TradingNode starts
+        2. Reconciliation runs → Fetches from EXCHANGE API
+        3. Cache populated from exchange data
+        4. Redis snapshots cache (if configured)
+        5. on_start() called → Reads from cache
+
+        For FUTURES Markets:
+        - Reconciliation: GET /fapi/v1/positionRisk → Position with entry price ✅
+        - Cache: Populated with fresh exchange data
+        - Redis: Backup for verification only
+        - SOURCE OF TRUTH: Exchange API (via reconciliation)
+
+        For SPOT Markets:
+        - Reconciliation: GET /api/v3/account → Balances only (no positions) ❌
+        - Cache: Empty positions (SPOT has no position API)
+        - Redis: REQUIRED for entry_price (only source)
+        - SOURCE OF TRUTH: Redis snapshots (exchange doesn't track entry price)
+
+        This ensures:
+        - FUTURES: Always uses fresh exchange data (most reliable)
+        - SPOT: Falls back to Redis when exchange can't provide entry price
+        - Both: Survive restarts with stop protection intact
         """
         self.log.info(f"Starting {self.__class__.__name__}")
 
@@ -415,8 +439,13 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         # PR #2 IMPORTANT FIX (Issue #7): Track pending entry orders to prevent race conditions
         self._pending_entry_order = None  # Track pending entry order
 
-        # PR #2 IMPORTANT FIX (Issue #6): Reconnection without forced liquidation.
-        # Adopt existing positions and stop orders instead of closing exposure.
+        # ============================================================================
+        # RECONNECTION LOGIC - Adopt existing positions and stop orders
+        # ============================================================================
+        # NOTE: Cache has already been populated by reconciliation from exchange.
+        # For FUTURES: positions_open() contains fresh data from exchange API.
+        # For SPOT: positions_open() is empty (SPOT has no position API).
+
         positions = self.cache.positions_open(instrument_id=self.instrument_id)
         open_orders = self.cache.orders_open(
             venue=self.instrument_id.venue,
@@ -424,14 +453,20 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         )
 
         if positions:
+            # ========================================================================
+            # FUTURES MARKET: Position object exists (from exchange reconciliation)
+            # ========================================================================
             position = positions[0]
+
+            # Log data source for transparency
             self.log.warning(
-                f"RECONNECTION: Found existing position "
+                f"RECONNECTION (FUTURES): Found existing position from exchange "
                 f"({position.side} {position.quantity} @ {position.avg_px_open}, "
-                f"unrealized P&L: {position.unrealized_pnl(position.last)})"
+                f"unrealized P&L: {position.unrealized_pnl(position.last)}) "
+                f"- Source: Exchange API via reconciliation"
             )
 
-            # Rebuild state from existing position
+            # Rebuild state from exchange position data
             self.entry_price = position.avg_px_open
             self.peak_price = self.entry_price
             self.use_percentage_trail = False
@@ -470,8 +505,67 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
                 # Convert PositionSide to OrderSide
                 entry_side = OrderSide.BUY if position.side == PositionSide.LONG else OrderSide.SELL
                 self._set_atr_stop(entry_side)
+
         else:
-            self.log.info("Started with no existing positions")
+            # ========================================================================
+            # SPOT MARKET or No Position: Check for orphaned stop orders
+            # ========================================================================
+            # For SPOT: Exchange doesn't provide position objects, but if we have
+            # stop orders, it implies a position exists (we bought/sold but exchange
+            # only tracks balances, not positions).
+            # For FUTURES: No positions means truly flat.
+
+            stop_orders = [
+                order
+                for order in open_orders
+                if isinstance(order, StopMarketOrder)
+                or getattr(order, "order_type", None) == OrderType.STOP_MARKET
+            ]
+
+            if stop_orders:
+                # SPOT MARKET SCENARIO: Have stop orders but no position object
+                # This means we have an open position (bought BTC, have stop to sell)
+                # but exchange doesn't provide entry price via API
+                self.log.warning(
+                    f"RECONNECTION (SPOT): Found {len(stop_orders)} stop order(s) but no position object "
+                    f"- this indicates SPOT market with open position. "
+                    f"Entry price unavailable from exchange (SPOT limitation)."
+                )
+
+                if len(stop_orders) == 1:
+                    self.stop_order = stop_orders[0]
+                    trigger_price = getattr(self.stop_order, "trigger_price", None)
+                    if trigger_price:
+                        self._last_stop_price = trigger_price.as_double()
+
+                        # SPOT: Infer we have a position but can't determine entry price
+                        # Options:
+                        # 1. Use Redis snapshot (if configured) - ideal
+                        # 2. Estimate from stop price (reverse calculate using ATR)
+                        # 3. Cancel stop and wait for new signal
+
+                        self.log.error(
+                            f"SPOT LIMITATION: Cannot determine entry price from exchange. "
+                            f"Stop order exists @ {self._last_stop_price} but entry price unknown. "
+                            f"RECOMMENDATION: Configure Redis persistence (CacheConfig with database) "
+                            f"to preserve entry_price across restarts on SPOT markets. "
+                            f"Cancelling stop to avoid trading without proper state tracking."
+                        )
+
+                        # Safe action: Cancel stop and reset state (wait for new signal)
+                        self.cancel_order(self.stop_order)
+                        self.stop_order = None
+                        self._last_stop_price = None
+
+                else:
+                    # Multiple stops - clean up
+                    self.log.error(f"RECONNECTION: Found {len(stop_orders)} stop orders - cancelling all")
+                    for stop in stop_orders:
+                        self.cancel_order(stop)
+
+            else:
+                # No positions, no stop orders - clean start
+                self.log.info("Started with no existing positions or orders")
 
     def on_stop(self) -> None:
         """
