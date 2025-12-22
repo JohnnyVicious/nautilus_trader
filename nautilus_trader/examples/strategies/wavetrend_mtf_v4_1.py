@@ -608,18 +608,24 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             )
             return
 
-        # PR #2 FIX (Issue #8): Also validate all WaveTrend indicators are initialized
+        # PR #2 FIX (Issue #8): Validate essential indicators are initialized
+        # CRITICAL: 5m WaveTrend + ATR must be ready (primary signal + stops)
+        # RELAXED: 1h/4h WaveTrend can be uninitialized - alignment logic handles gracefully
         if not self.wt_5m.initialized:
             self.log.debug("Skipping entry - 5m WaveTrend not initialized")
             return
 
-        if not self.wt_1h.initialized:
-            self.log.debug("Skipping entry - 1h WaveTrend not initialized")
-            return
-
-        if not self.wt_4h.initialized:
-            self.log.debug("Skipping entry - 4h WaveTrend not initialized")
-            return
+        # Log partial initialization status (informational for live trading monitoring)
+        if not self.wt_1h.initialized or not self.wt_4h.initialized:
+            uninit = []
+            if not self.wt_1h.initialized:
+                uninit.append("1h")
+            if not self.wt_4h.initialized:
+                uninit.append("4h")
+            self.log.info(
+                f"Trading with partial initialization - {', '.join(uninit)} WaveTrend "
+                f"not ready yet (alignment logic will handle gracefully)"
+            )
 
         # Check for bullish cross on 5m
         bullish = self.wt_5m.bullish_cross()
