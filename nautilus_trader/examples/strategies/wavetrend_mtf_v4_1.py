@@ -738,13 +738,17 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             # Set initial ATR-based stop
             self._set_atr_stop(event.order_side)
 
-    def on_order_cancelled(self, event) -> None:
+    def on_order_canceled(self, event) -> None:
         """
         Handle order cancellation confirmation.
 
         PR #1 CRITICAL FIX (Issue #1): This prevents creating duplicate stops by
         waiting for cancel confirmation before submitting replacement stop.
+
+        BUGFIX: After cancel completes, recreate the stop based on current mode.
         """
+        self.log.info(f"on_order_cancelled called for order {event.client_order_id}, stop_order={self.stop_order.client_order_id if self.stop_order else None}")
+
         # Clear the stop reference if it was our stop that got cancelled
         if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
             self.log.info(
@@ -752,6 +756,20 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             )
             self.stop_order = None
             self._pending_stop_cancel = False
+
+            # BUGFIX: Recreate the stop after cancellation completes
+            # This is critical - without it, position remains unprotected!
+            positions = self.cache.positions_open(instrument_id=self.instrument_id)
+            if positions:
+                position = positions[0]
+                if self.use_percentage_trail:
+                    # We're in percentage trailing mode - recreate percentage stop
+                    self.log.info("Recreating percentage trailing stop after cancel")
+                    self._set_percentage_stop(position.side)
+                else:
+                    # We're in ATR mode - recreate ATR stop
+                    self.log.info("Recreating ATR stop after cancel")
+                    self._set_atr_stop(position.side)
 
     def on_order_rejected(self, event) -> None:
         """
