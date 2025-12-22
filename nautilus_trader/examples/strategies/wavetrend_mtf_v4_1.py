@@ -773,8 +773,8 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             self._last_stop_price = None
 
             # Check if position still exists
-            position = self.cache.position(self.instrument_id)
-            if position is not None and position.is_open:
+            positions = self.cache.positions_open(instrument_id=self.instrument_id)
+            if positions:
                 # Position is open but stop was rejected - CRITICAL situation
                 # Strategy: Close position immediately (safest approach)
                 self.log.warning(
@@ -802,9 +802,10 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         PR #1 CRITICAL FIX (Issues #1, #5): Deferred creation + validation.
         """
         # Check position exists
-        position = self.cache.position(self.instrument_id)
-        if position is None or not position.is_open:
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+        if not positions:
             return
+        position = positions[0]
 
         # Get instrument from cache
         instrument = self.cache.instrument(self.instrument_id)
@@ -919,9 +920,10 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         PR #1 CRITICAL FIX (Issues #1, #5): Deferred creation + validation.
         """
         # Check position exists
-        position = self.cache.position(self.instrument_id)
-        if position is None or not position.is_open:
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+        if not positions:
             return
+        position = positions[0]
 
         # Get instrument from cache
         instrument = self.cache.instrument(self.instrument_id)
