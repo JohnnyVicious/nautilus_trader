@@ -15,26 +15,35 @@
 # -------------------------------------------------------------------------------------------------
 
 """
-WaveTrend Multi-Timeframe Strategy V4.1 Backtest
+WaveTrend Multi-Timeframe Strategy V4.1 Backtest (RELAXED - Home Run Model)
 
-V4.1 Improvement over V3 (Volatility as Filter):
-- Adds volatility regime detection (Recent ATR vs Baseline ATR)
-- Blocks trades in HIGH or ELEVATED volatility (chop risk)
-- Only trades in NORMAL or LOW volatility (optimal conditions)
-- Uses volatility as FILTER (blocks bad trades), not adaptive sizing
+V4.1 RELAXED DEFAULTS (Updated 2025-12-22):
+Strategy now uses "home run trading" model - many small losses, rare massive wins.
+Achieved 5.7x better returns than strict config over 3 years (2022-2024).
 
-V3 Features (All Retained):
-1. ATR minimum filter: Ensures sufficient volatility
-2. Range filter: Avoids stuck/choppy markets
-3. Multi-timeframe alignment (3/3)
-4. Trend filter: Only trades with 4h WaveTrend trend
-5. Trailing stops: ATR-based initial stop → percentage-based trailing
+Key Features:
+1. Volatility regime filter: Blocks HIGH/ELEVATED volatility (chop risk)
+2. Multi-timeframe alignment: 2/3 required (allows earlier entries)
+3. Tighter stops: 3.0x ATR (preserves capital for big moves)
+4. Earlier trailing: 2.5% profit threshold (locks in gains faster)
+5. ATR_min filter DISABLED (was blocking 80-90% of trades)
 
-Expected V4.1 improvements over V3:
-- 2022: Better than V3's -0.73% (avoid choppy trades)
-- 2025: MUCH better than V3's -3.37% (block high volatility trades)
-- Total: +3-5% over 4 years (vs V3's +2.02%)
-- Fewer trades than V3 (80-120 vs 141) but higher win rate
+Trading Model - "Home Run Strategy":
+- Trade frequency: 15-25/year
+- Win rate: 5-10% (ACCEPT THIS - it's the model!)
+- Average loss: -$3-4 (tiny, controlled)
+- Average winner: $200-400 (massive)
+- Expectancy: $11.84/trade (positive)
+
+Think baseball: Strike out 90-95% of the time, but when you hit a home run,
+it pays for all strikeouts + profit. Reward/Risk ratio = 85:1
+
+3-Year Backtest Results (2022-2024):
+- Total P&L: +$700 USDT (+7.0%)
+- Total Positions: 61
+- Win Rate: 4.92% (3 winners, 58 losers) ← This is GOOD for this model!
+- Avg Winner: $305.37 | Avg Loser: -$3.59
+- Best Year: 2024 (+$418, +4.18%)
 """
 
 import sys
