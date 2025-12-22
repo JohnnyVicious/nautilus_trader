@@ -355,12 +355,13 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         self.low_vol_threshold = config.low_vol_threshold
 
     def on_start(self) -> None:
-        """Actions to be performed on strategy start."""
-        self.log.info(f"Starting {self.__class__.__name__}")
+        """
+        Actions to be performed on strategy start.
 
-        # PR #1 CRITICAL FIX: Add tracking flags for stop order management
-        self._pending_stop_cancel = False  # Track if waiting for cancel confirmation
-        self._last_stop_price = None  # Track last submitted stop price (spam prevention)
+        PR #2 IMPORTANT FIX (Issue #6): Reconnection handling - checks for existing
+        positions on startup and handles them conservatively.
+        """
+        self.log.info(f"Starting {self.__class__.__name__}")
 
         # Subscribe to 5-minute bars
         bar_type_5m = BarType.from_str(
@@ -381,6 +382,48 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         self.subscribe_bars(bar_type_4h)
 
         self.log.info("Subscribed to 5m, 1h, 4h bars")
+
+        # Initialize state variables
+        self.entry_price = None
+        self.peak_price = None
+        self.stop_order = None
+        self.use_percentage_trail = False
+
+        # PR #1 CRITICAL FIX: Add tracking flags for stop order management
+        self._pending_stop_cancel = False  # Track if waiting for cancel confirmation
+        self._last_stop_price = None  # Track last submitted stop price (spam prevention)
+
+        # PR #2 IMPORTANT FIX (Issue #7): Track pending entry orders to prevent race conditions
+        self._pending_entry_order = None  # Track pending entry order
+
+        # PR #2 IMPORTANT FIX (Issue #6): CONSERVATIVE RECONNECTION - Close existing positions
+        # This ensures clean restart without inheriting unknown state
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+
+        if positions:
+            position = positions[0]
+            self.log.warning(
+                f"RECONNECTION: Found existing position - closing it for clean restart "
+                f"({position.side} {position.quantity} @ {position.avg_px_open}, "
+                f"unrealized P&L: {position.unrealized_pnl(position.last)})"
+            )
+
+            # Cancel all open orders first
+            open_orders = self.cache.orders_open(
+                venue=self.instrument_id.venue,
+                instrument_id=self.instrument_id,
+            )
+
+            for order in open_orders:
+                self.log.info(f"Cancelling existing order: {order.client_order_id}")
+                self.cancel_order(order)
+
+            # Close position
+            self.close_all_positions(self.instrument_id)
+
+            self.log.info("Closed existing position - starting fresh")
+        else:
+            self.log.info("Started with no existing positions")
 
     def on_stop(self) -> None:
         """Actions to be performed on strategy stop."""
@@ -525,9 +568,57 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             return "NORMAL"
 
     def _check_entry_signals(self, bar: Bar) -> None:
-        """Check for entry signals based on WaveTrend crosses and alignment."""
+        """
+        Check for entry signals based on WaveTrend crosses and alignment.
+
+        PR #2 IMPORTANT FIX (Issue #7): Checks for pending entry orders to prevent
+        race conditions where multiple entry orders could be submitted before first fill.
+
+        PR #2 IMPORTANT FIX (Issue #8): Validates ATR and all indicators before entry
+        to ensure we can set stops properly.
+        """
         # Don't enter if already in a position
         if self.portfolio.is_flat(self.instrument_id) is False:
+            return
+
+        # PR #2 FIX (Issue #7): Don't enter if we already have a pending entry order
+        if self._pending_entry_order is not None:
+            self.log.debug(
+                f"Skipping entry signal - order {self._pending_entry_order.client_order_id} still pending"
+            )
+            return
+
+        # PR #2 FIX (Issue #8): Validate ATR is ready BEFORE checking entry signals
+        # CRITICAL: Must ensure ATR is valid so we can set stops after entry
+        if not self.atr.initialized:
+            self.log.debug("Skipping entry check - ATR indicator not fully initialized")
+            return
+
+        atr = self.atr.value
+        if atr is None or atr <= 0 or not math.isfinite(atr):
+            self.log.debug(f"Skipping entry check - ATR not valid (ATR={atr})")
+            return
+
+        # Validate ATR is reasonable (sanity check for calculation errors)
+        current_price = bar.close.as_double()
+        if atr > current_price * 10:
+            self.log.warning(
+                f"ATR suspiciously large ({atr:.2f}) vs price ({current_price:.2f}) - "
+                f"skipping entry"
+            )
+            return
+
+        # PR #2 FIX (Issue #8): Also validate all WaveTrend indicators are initialized
+        if not self.wt_5m.initialized:
+            self.log.debug("Skipping entry - 5m WaveTrend not initialized")
+            return
+
+        if not self.wt_1h.initialized:
+            self.log.debug("Skipping entry - 1h WaveTrend not initialized")
+            return
+
+        if not self.wt_4h.initialized:
+            self.log.debug("Skipping entry - 4h WaveTrend not initialized")
             return
 
         # Check for bullish cross on 5m
@@ -671,7 +762,11 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
                 self.log.info(f"Aligned but blocked by: {', '.join(reasons)}")
 
     def _enter_long(self) -> None:
-        """Enter a long position."""
+        """
+        Enter a long position.
+
+        PR #2 IMPORTANT FIX (Issue #7): Tracks pending entry order to prevent duplicates.
+        """
         instrument = self.cache.instrument(self.instrument_id)
         if instrument is None:
             self.log.error(f"Cannot enter LONG - instrument {self.instrument_id} not found in cache")
@@ -682,10 +777,19 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             order_side=OrderSide.BUY,
             quantity=instrument.make_qty(self.trade_size),
         )
+
+        # PR #2 FIX (Issue #7): Track pending entry order BEFORE submitting
+        self._pending_entry_order = order
+
         self.submit_order(order)
+        self.log.info(f"Submitted LONG entry order: {order.client_order_id}")
 
     def _enter_short(self) -> None:
-        """Enter a short position."""
+        """
+        Enter a short position.
+
+        PR #2 IMPORTANT FIX (Issue #7): Tracks pending entry order to prevent duplicates.
+        """
         instrument = self.cache.instrument(self.instrument_id)
         if instrument is None:
             self.log.error(f"Cannot enter SHORT - instrument {self.instrument_id} not found in cache")
@@ -696,13 +800,20 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             order_side=OrderSide.SELL,
             quantity=instrument.make_qty(self.trade_size),
         )
+
+        # PR #2 FIX (Issue #7): Track pending entry order BEFORE submitting
+        self._pending_entry_order = order
+
         self.submit_order(order)
+        self.log.info(f"Submitted SHORT entry order: {order.client_order_id}")
 
     def on_order_filled(self, event) -> None:
         """
         Handle order filled events.
 
         PR #1 CRITICAL FIX (Issue #2): Detect stop fills vs entry fills.
+        PR #2 IMPORTANT FIX (Issue #7): Clear pending entry order flag on fill.
+
         CRITICAL: Must distinguish between:
         - Entry fills (market orders) → initialize state and set stop
         - Stop fills (stop orders) → clear state and close position
@@ -721,11 +832,16 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             self.use_percentage_trail = False
             self._pending_stop_cancel = False
             self._last_stop_price = None
+            # PR #2 FIX: Also clear pending entry order (defensive)
+            self._pending_entry_order = None
 
             return  # Don't treat stop fill as new entry
 
-        # This is an entry fill (market order)
-        if event.order_side == OrderSide.BUY or event.order_side == OrderSide.SELL:
+        # PR #2 FIX (Issue #7): Check if this was our pending entry order
+        if self._pending_entry_order is not None and event.client_order_id == self._pending_entry_order.client_order_id:
+            # Clear pending entry flag - order has filled
+            self._pending_entry_order = None
+
             # Entry order filled - set initial stop
             self.entry_price = event.last_px.as_double()
             self.peak_price = self.entry_price
@@ -737,6 +853,12 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
 
             # Set initial ATR-based stop
             self._set_atr_stop(event.order_side)
+            return
+
+        # Unknown order fill (shouldn't happen in normal operation)
+        self.log.warning(
+            f"Received fill for unknown order: {event.client_order_id}"
+        )
 
     def on_order_canceled(self, event) -> None:
         """
@@ -745,9 +867,19 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         PR #1 CRITICAL FIX (Issue #1): This prevents creating duplicate stops by
         waiting for cancel confirmation before submitting replacement stop.
 
+        PR #2 IMPORTANT FIX (Issue #7): Clear pending entry order flag on cancellation.
+
         BUGFIX: After cancel completes, recreate the stop based on current mode.
         """
-        self.log.info(f"on_order_cancelled called for order {event.client_order_id}, stop_order={self.stop_order.client_order_id if self.stop_order else None}")
+        self.log.info(f"on_order_canceled called for order {event.client_order_id}")
+
+        # PR #2 FIX (Issue #7): Check if this was our pending entry order (user manually cancelled?)
+        if self._pending_entry_order is not None and event.client_order_id == self._pending_entry_order.client_order_id:
+            self.log.info(
+                f"Entry order {self._pending_entry_order.client_order_id} cancelled"
+            )
+            self._pending_entry_order = None
+            return
 
         # Clear the stop reference if it was our stop that got cancelled
         if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
@@ -777,7 +909,18 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
 
         PR #1 CRITICAL FIX (Issue #3): If a stop order is rejected, the position
         is UNPROTECTED. We must either retry stop submission or close position.
+
+        PR #2 IMPORTANT FIX (Issue #7): Clear pending entry order flag on rejection.
         """
+        # PR #2 FIX (Issue #7): Check if this was our pending entry order
+        if self._pending_entry_order is not None and event.client_order_id == self._pending_entry_order.client_order_id:
+            self.log.warning(
+                f"Entry order rejected: {event.client_order_id} - Reason: {event.reason}"
+            )
+            # Clear pending flag so we can try again on next signal
+            self._pending_entry_order = None
+            return
+
         # Check if this was our stop order being rejected
         if self.stop_order is not None and event.client_order_id == self.stop_order.client_order_id:
             self.log.error(
@@ -808,7 +951,7 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
 
             return
 
-        # Entry order rejection (less critical but should log)
+        # Unknown order rejection
         self.log.warning(
             f"Order rejected: {event.client_order_id} - Reason: {event.reason}"
         )
