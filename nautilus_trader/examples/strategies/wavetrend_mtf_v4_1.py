@@ -26,6 +26,8 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.identifiers import InstrumentId
@@ -413,40 +415,95 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         # PR #2 IMPORTANT FIX (Issue #7): Track pending entry orders to prevent race conditions
         self._pending_entry_order = None  # Track pending entry order
 
-        # PR #2 IMPORTANT FIX (Issue #6): CONSERVATIVE RECONNECTION - Close existing positions
-        # This ensures clean restart without inheriting unknown state
+        # PR #2 IMPORTANT FIX (Issue #6): Reconnection without forced liquidation.
+        # Adopt existing positions and stop orders instead of closing exposure.
         positions = self.cache.positions_open(instrument_id=self.instrument_id)
+        open_orders = self.cache.orders_open(
+            venue=self.instrument_id.venue,
+            instrument_id=self.instrument_id,
+        )
 
         if positions:
             position = positions[0]
             self.log.warning(
-                f"RECONNECTION: Found existing position - closing it for clean restart "
+                f"RECONNECTION: Found existing position "
                 f"({position.side} {position.quantity} @ {position.avg_px_open}, "
                 f"unrealized P&L: {position.unrealized_pnl(position.last)})"
             )
 
-            # Cancel all open orders first
-            open_orders = self.cache.orders_open(
-                venue=self.instrument_id.venue,
-                instrument_id=self.instrument_id,
-            )
+            # Rebuild state from existing position
+            self.entry_price = position.avg_px_open
+            self.peak_price = self.entry_price
+            self.use_percentage_trail = False
 
-            for order in open_orders:
-                self.log.info(f"Cancelling existing order: {order.client_order_id}")
-                self.cancel_order(order)
+            # Identify existing stop orders
+            stop_orders = [
+                order
+                for order in open_orders
+                if isinstance(order, StopMarketOrder)
+                or getattr(order, "order_type", None) == OrderType.STOP_MARKET
+            ]
 
-            # Close position
-            self.close_all_positions(self.instrument_id)
-
-            self.log.info("Closed existing position - starting fresh")
+            if len(stop_orders) == 1:
+                self.stop_order = stop_orders[0]
+                trigger_price = getattr(self.stop_order, "trigger_price", None)
+                if trigger_price is not None:
+                    self._last_stop_price = trigger_price.as_double()
+                self.log.info(
+                    f"RECONNECTION: Adopted existing stop order {self.stop_order.client_order_id} "
+                    f"@ {self._last_stop_price if self._last_stop_price is not None else 'unknown'}"
+                )
+            elif len(stop_orders) > 1:
+                self.log.error(
+                    f"RECONNECTION: Found {len(stop_orders)} stop orders (expected 0-1) - "
+                    f"cancelling all and recreating"
+                )
+                for stop in stop_orders:
+                    self.cancel_order(stop)
+                self.stop_order = None
+                self._pending_stop_cancel = True  # Recreate after cancellations complete
+            else:
+                # No stop on an open position - create emergency protection
+                self.log.error(
+                    "RECONNECTION: Position has NO STOP ORDER - creating emergency ATR stop"
+                )
+                # Convert PositionSide to OrderSide
+                entry_side = OrderSide.BUY if position.side == PositionSide.LONG else OrderSide.SELL
+                self._set_atr_stop(entry_side)
         else:
             self.log.info("Started with no existing positions")
 
     def on_stop(self) -> None:
-        """Actions to be performed on strategy stop."""
+        """
+        Actions to be performed on strategy stop.
+
+        IMPORTANT: This is called on GRACEFUL shutdown only (Ctrl+C, SIGTERM).
+        In crash scenarios (exception, SIGKILL), this method is NOT called, and
+        positions remain on the exchange with their stop orders intact.
+
+        Strategy: Cancel orders but PRESERVE positions with stop protection.
+        - On restart, reconciliation will fetch positions from exchange
+        - on_start() reconnection logic will adopt them safely
+        - Stops remain active on exchange (not cancelled here)
+
+        This ensures consistent behavior whether shutdown is graceful or forced.
+        """
         self.log.info(f"Stopping {self.__class__.__name__}")
+
+        # Cancel pending orders (prevents stale/orphaned orders)
         self.cancel_all_orders(self.instrument_id)
-        self.close_all_positions(self.instrument_id)
+
+        # DO NOT close positions - let them survive restart with stop protection
+        # Positions have ATR or trailing stops active on exchange
+        # Reconciliation will adopt them on restart via on_start() logic
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+        if positions:
+            position = positions[0]
+            self.log.info(
+                f"Preserving position on shutdown: {position.side} {position.quantity} @ {position.avg_px_open} "
+                f"(unrealized P&L: {position.unrealized_pnl(position.last)}) - "
+                f"will be adopted on restart"
+            )
 
     def on_bar(self, bar: Bar) -> None:
         """Handle bar updates for all timeframes."""
@@ -917,14 +974,16 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             positions = self.cache.positions_open(instrument_id=self.instrument_id)
             if positions:
                 position = positions[0]
+                # Convert PositionSide to OrderSide
+                entry_side = OrderSide.BUY if position.side == PositionSide.LONG else OrderSide.SELL
                 if self.use_percentage_trail:
                     # We're in percentage trailing mode - recreate percentage stop
                     self.log.info("Recreating percentage trailing stop after cancel")
-                    self._set_percentage_stop(position.side)
+                    self._set_percentage_stop(entry_side)
                 else:
                     # We're in ATR mode - recreate ATR stop
                     self.log.info("Recreating ATR stop after cancel")
-                    self._set_atr_stop(position.side)
+                    self._set_atr_stop(entry_side)
 
     def on_order_rejected(self, event) -> None:
         """
