@@ -461,8 +461,7 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
             # Log data source for transparency
             self.log.warning(
                 f"RECONNECTION (FUTURES): Found existing position from exchange "
-                f"({position.side} {position.quantity} @ {position.avg_px_open}, "
-                f"unrealized P&L: {position.unrealized_pnl(position.last)}) "
+                f"({position.side} {position.quantity} @ {position.avg_px_open}) "
                 f"- Source: Exchange API via reconciliation"
             )
 
@@ -594,8 +593,7 @@ class WaveTrendMultiTimeframeV4_1(Strategy):
         if positions:
             position = positions[0]
             self.log.info(
-                f"Preserving position on shutdown: {position.side} {position.quantity} @ {position.avg_px_open} "
-                f"(unrealized P&L: {position.unrealized_pnl(position.last)}) - "
+                f"Preserving position on shutdown: {position.side} {position.quantity} @ {position.avg_px_open} - "
                 f"will be adopted on restart"
             )
 
